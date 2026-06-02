@@ -1,19 +1,24 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   AlertTriangle,
+  BarChart3,
   CalendarDays,
   CheckCircle2,
   ClipboardCopy,
+  ClipboardList,
   FileCheck2,
   FileText,
   MessageCircle,
+  MessageSquarePlus,
   RefreshCw,
   Save,
   Search,
   Send,
   ShieldCheck,
   Sparkles,
+  Target,
+  Users,
 } from "lucide-react";
 import sampleCases from "./sample-cases.json";
 import "./styles.css";
@@ -22,6 +27,8 @@ const serviceTypes = ["초진 문의", "예약 안내", "비용 문의", "내원
 const toneOptions = ["친절하게", "간결하게", "전문적으로"];
 const defaultManualCase = "허리 통증으로 한의원 방문이 처음인 고객이 카카오톡으로 예약 가능 시간과 준비물을 문의했다.";
 const storageKey = "kakao-counseling-draft-history";
+const analyticsKey = "kakao-counseling-week3-analytics";
+const feedbackKey = "kakao-counseling-week3-feedback";
 
 const riskRules = [
   { label: "효과 보장", terms: ["완치", "100% 효과", "무조건 좋아집니다", "치료 보장", "즉시 효과", "특효"] },
@@ -47,6 +54,35 @@ function loadHistory() {
   } catch {
     return [];
   }
+}
+
+function loadJson(key, fallback) {
+  try {
+    return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback));
+  } catch {
+    return fallback;
+  }
+}
+
+function getChannel() {
+  const url = new URL(window.location.href);
+  const from = url.searchParams.get("from") || url.searchParams.get("utm_source");
+  if (from) return from;
+  if (document.referrer.includes("notion")) return "notion";
+  if (document.referrer) return "referral";
+  return "direct";
+}
+
+function createEmptyAnalytics() {
+  return {
+    visits: 0,
+    draftGenerated: 0,
+    copied: 0,
+    saved: 0,
+    feedbackSubmitted: 0,
+    byChannel: {},
+    events: [],
+  };
 }
 
 function buildMessage({ selectedCase, serviceType, tone, date }) {
@@ -109,6 +145,34 @@ function App() {
   const [draftText, setDraftText] = useState("");
   const [notice, setNotice] = useState("");
   const [history, setHistory] = useState(loadHistory);
+  const [analytics, setAnalytics] = useState(() => loadJson(analyticsKey, createEmptyAnalytics()));
+  const [feedback, setFeedback] = useState(() => loadJson(feedbackKey, []));
+  const [feedbackForm, setFeedbackForm] = useState({
+    role: "한의원 원장/실무자",
+    score: "4",
+    liked: "",
+    issue: "",
+    next: "",
+  });
+
+  useEffect(() => {
+    if (sessionStorage.getItem("kakao-counseling-week3-visit")) return;
+    sessionStorage.setItem("kakao-counseling-week3-visit", "1");
+    const channel = getChannel();
+    setAnalytics((previous) => {
+      const next = {
+        ...previous,
+        visits: previous.visits + 1,
+        byChannel: { ...previous.byChannel, [channel]: (previous.byChannel[channel] || 0) + 1 },
+        events: [
+          { id: `${Date.now()}-visit`, type: "방문", detail: channel, at: new Date().toISOString() },
+          ...previous.events,
+        ].slice(0, 12),
+      };
+      localStorage.setItem(analyticsKey, JSON.stringify(next));
+      return next;
+    });
+  }, []);
 
   const cases = useMemo(() => {
     if (sourceMode === "manual") {
@@ -119,6 +183,17 @@ function App() {
 
   const selectedCase = cases.find((item) => item.id === selectedCaseId) || cases[0];
   const riskFlags = useMemo(() => findRiskFlags(draftText), [draftText]);
+  const feedbackAverage = useMemo(() => {
+    if (!feedback.length) return 0;
+    return Math.round((feedback.reduce((sum, item) => sum + item.score, 0) / feedback.length) * 10) / 10;
+  }, [feedback]);
+  const copyRate = analytics.draftGenerated ? Math.round((analytics.copied / analytics.draftGenerated) * 100) : 0;
+  const strongestSignal =
+    analytics.draftGenerated && !analytics.copied
+      ? "초안 생성 뒤 복사까지 이어지는지 추가 확인 필요"
+      : analytics.copied
+        ? "생성된 안내문을 실제 발송 전 문구로 가져가려는 흐름이 확인됨"
+        : "먼저 테스트 사용자에게 링크를 보내 사용 흐름을 확보해야 함";
   const qaStatus = useMemo(
     () => [
       { label: "샘플 상담 데이터 연결", pass: sampleCases.length >= 4 },
@@ -142,12 +217,14 @@ function App() {
     const nextDraft = buildMessage({ selectedCase, serviceType, tone, date });
     setDraft(nextDraft);
     setDraftText(nextDraft.message);
+    recordAnalytics("draftGenerated", `${serviceType} · ${tone}`);
     setNotice("상담 안내문 초안이 생성됐습니다.");
   }
 
   async function copyDraft() {
     if (!draftText) return;
     await navigator.clipboard.writeText(draftText);
+    recordAnalytics("copied", serviceType);
     setNotice("안내문을 클립보드에 복사했습니다.");
   }
 
@@ -167,14 +244,60 @@ function App() {
     localStorage.setItem(storageKey, JSON.stringify(nextHistory));
     localStorage.setItem("kakao-counseling-latest-draft", JSON.stringify(nextItem));
     setHistory(nextHistory);
+    recordAnalytics("saved", serviceType);
     setNotice("브라우저에 최신 안내문을 저장했습니다.");
+  }
+
+  function recordAnalytics(type, detail) {
+    const labels = {
+      draftGenerated: "초안 생성",
+      copied: "복사",
+      saved: "저장",
+      feedbackSubmitted: "피드백",
+    };
+    setAnalytics((previous) => {
+      const next = {
+        ...previous,
+        [type]: (previous[type] || 0) + 1,
+        events: [
+          { id: `${Date.now()}-${type}`, type: labels[type] || type, detail, at: new Date().toISOString() },
+          ...previous.events,
+        ].slice(0, 12),
+      };
+      localStorage.setItem(analyticsKey, JSON.stringify(next));
+      return next;
+    });
+  }
+
+  function submitFeedback() {
+    const liked = feedbackForm.liked.trim();
+    const issue = feedbackForm.issue.trim();
+    if (!liked || !issue) {
+      setNotice("좋았던 점과 아쉬웠던 점을 모두 적어주세요.");
+      return;
+    }
+    const nextItem = {
+      id: `${Date.now()}`,
+      role: feedbackForm.role.trim() || "테스트 사용자",
+      score: Number(feedbackForm.score),
+      liked,
+      issue,
+      next: feedbackForm.next.trim(),
+      at: new Date().toISOString(),
+    };
+    const nextFeedback = [nextItem, ...feedback].slice(0, 8);
+    localStorage.setItem(feedbackKey, JSON.stringify(nextFeedback));
+    setFeedback(nextFeedback);
+    recordAnalytics("feedbackSubmitted", `${nextItem.role} · ${nextItem.score}점`);
+    setFeedbackForm({ role: "한의원 원장/실무자", score: "4", liked: "", issue: "", next: "" });
+    setNotice("피드백을 기록했습니다.");
   }
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">Founders Week 2 · v0.1</p>
+          <p className="eyebrow">Founders Week 3 · v0.2</p>
           <h1>상담 카톡 안내문 생성·검수 시스템</h1>
         </div>
         <div className="status-pill">
@@ -344,18 +467,180 @@ function App() {
         </section>
       </section>
 
-      <section className="submission-strip" aria-label="2주차 제출 요약">
+      <section className="week3-dashboard" aria-label="3주차 사용 기록과 피드백">
+        <div className="panel-heading">
+          <BarChart3 size={20} />
+          <h2>3주차 사용 기록·피드백 대시보드</h2>
+        </div>
+
+        <div className="metrics-grid" aria-label="사용 기록 숫자">
+          <div>
+            <span>방문</span>
+            <strong>{analytics.visits}</strong>
+          </div>
+          <div>
+            <span>초안 생성</span>
+            <strong>{analytics.draftGenerated}</strong>
+          </div>
+          <div>
+            <span>복사율</span>
+            <strong>{copyRate}%</strong>
+          </div>
+          <div>
+            <span>피드백</span>
+            <strong>{feedback.length}</strong>
+          </div>
+          <div>
+            <span>평균 점수</span>
+            <strong>{feedbackAverage || "-"}</strong>
+          </div>
+        </div>
+
+        <div className="week3-grid">
+          <section className="insight-block">
+            <div className="block-title">
+              <Target size={18} />
+              <h3>타겟·메시지·채널</h3>
+            </div>
+            <dl className="compact-list">
+              <div>
+                <dt>WHO</dt>
+                <dd>상담 후 카카오톡 안내문을 매일 직접 정리하는 1인 한의원 원장</dd>
+              </div>
+              <div>
+                <dt>WHAT</dt>
+                <dd>상담 끝나고 3분 안에 환자용 카톡 초안 만들기</dd>
+              </div>
+              <div>
+                <dt>WHERE</dt>
+                <dd>가까운 한의사 동료 1:1 데모, 병원 운영자 커뮤니티 공유</dd>
+              </div>
+            </dl>
+          </section>
+
+          <section className="insight-block">
+            <div className="block-title">
+              <ClipboardList size={18} />
+              <h3>데이터 해석</h3>
+            </div>
+            <p className="signal-text">{strongestSignal}</p>
+            <div className="event-list">
+              {analytics.events.length ? (
+                analytics.events.slice(0, 5).map((event) => (
+                  <div key={event.id}>
+                    <strong>{event.type}</strong>
+                    <span>
+                      {event.detail} · {new Date(event.at).toLocaleString("ko-KR")}
+                    </span>
+                  </div>
+                ))
+              ) : (
+                <p>아직 기록된 이벤트가 없습니다.</p>
+              )}
+            </div>
+          </section>
+
+          <section className="insight-block feedback-card">
+            <div className="block-title">
+              <MessageSquarePlus size={18} />
+              <h3>피드백 기록</h3>
+            </div>
+            <label className="field-label" htmlFor="feedback-role">테스트 사용자</label>
+            <input
+              id="feedback-role"
+              className="input"
+              value={feedbackForm.role}
+              onChange={(event) => setFeedbackForm({ ...feedbackForm, role: event.target.value })}
+            />
+            <label className="field-label" htmlFor="feedback-score">다시 쓸 의향</label>
+            <select
+              id="feedback-score"
+              className="input"
+              value={feedbackForm.score}
+              onChange={(event) => setFeedbackForm({ ...feedbackForm, score: event.target.value })}
+            >
+              <option value="5">5점</option>
+              <option value="4">4점</option>
+              <option value="3">3점</option>
+              <option value="2">2점</option>
+              <option value="1">1점</option>
+            </select>
+            <textarea
+              className="textarea feedback-input"
+              placeholder="좋았던 점"
+              value={feedbackForm.liked}
+              onChange={(event) => setFeedbackForm({ ...feedbackForm, liked: event.target.value })}
+            />
+            <textarea
+              className="textarea feedback-input"
+              placeholder="아쉬웠던 점"
+              value={feedbackForm.issue}
+              onChange={(event) => setFeedbackForm({ ...feedbackForm, issue: event.target.value })}
+            />
+            <input
+              className="input"
+              placeholder="4주차에 바랄 점"
+              value={feedbackForm.next}
+              onChange={(event) => setFeedbackForm({ ...feedbackForm, next: event.target.value })}
+            />
+            <button className="secondary-action" type="button" onClick={submitFeedback}>
+              <Save size={18} />
+              피드백 저장
+            </button>
+          </section>
+
+          <section className="insight-block">
+            <div className="block-title">
+              <Users size={18} />
+              <h3>VOC 요약</h3>
+            </div>
+            <div className="feedback-list">
+              {feedback.length ? (
+                feedback.slice(0, 4).map((item) => (
+                  <article key={item.id}>
+                    <strong>
+                      {item.role} · {item.score}점
+                    </strong>
+                    <p>좋았던 점: {item.liked}</p>
+                    <p>아쉬웠던 점: {item.issue}</p>
+                    {item.next && <p>다음 요청: {item.next}</p>}
+                  </article>
+                ))
+              ) : (
+                <p>테스트 사용자에게 링크를 보내고 받은 반응을 여기에 기록하세요.</p>
+              )}
+            </div>
+          </section>
+        </div>
+
+        <div className="decision-board">
+          <div>
+            <span>Keep</span>
+            <strong>상담 입력 → 초안 생성 → 위험 표현 검수 흐름은 유지</strong>
+          </div>
+          <div>
+            <span>Change</span>
+            <strong>초안이 길어지는 문제를 줄이고, 카톡용 짧은 버전을 별도로 제공</strong>
+          </div>
+          <div>
+            <span>Try</span>
+            <strong>4주차에는 템플릿 저장과 자주 쓰는 문구 재사용 기능 추가</strong>
+          </div>
+        </div>
+      </section>
+
+      <section className="submission-strip" aria-label="3주차 제출 요약">
         <div>
-          <span>실제로 되는 기능</span>
-          <strong>상담 상황 선택/입력, 안내문 생성, 위험 표현 검수</strong>
+          <span>실제 사용 기록</span>
+          <strong>방문·초안 생성·복사·저장 이벤트를 브라우저에 기록</strong>
         </div>
         <div>
-          <span>아직 제외</span>
-          <strong>카카오톡 자동 발송, 로그인, 환자정보 저장, 결제</strong>
+          <span>사용자 반응</span>
+          <strong>피드백 2건 이상 기록 후 VOC 요약으로 제출</strong>
         </div>
         <div>
-          <span>검수 기준</span>
-          <strong>발송 전 담당자 최종 확인 필요</strong>
+          <span>4주차 개선점</span>
+          <strong>짧은 카톡 버전, 템플릿 저장, 재사용 흐름 개선</strong>
         </div>
       </section>
 
